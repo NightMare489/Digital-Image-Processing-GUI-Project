@@ -197,19 +197,25 @@ class ImageProcessingApp:
             to=360,
             variable=self.rotation_var,
             orient=HORIZONTAL,
-            command=lambda val: self.rotation_var.set(f'{int(float(val)):03}'),
             length=130
 
         )
         rotation_slider.pack(side=LEFT, fill="none", expand=YES)
         
-        rotation_value = ttk.Label(rotation_frame, textvariable=self.rotation_var)
+        formatted_rotation = tk.StringVar()
+
+        def update_rotation_text(*args):
+            formatted_rotation.set(f"{int(float(self.rotation_var.get())):03}")
+
+        self.rotation_var.trace_add("write", update_rotation_text)
+        
+        rotation_value = ttk.Label(rotation_frame, textvariable=formatted_rotation)
         rotation_value.pack(side=RIGHT)
         
         rotate_btn = ttk.Button(
             transform_frame,
             text="Apply Rotation",
-            command=lambda: self.rotate_image(angle=self.rotation_var.get())
+            command=lambda: self.rotate_image(angle=int(self.rotation_var.get()))
         )
         rotate_btn.pack(pady=5, fill=X, padx=5)
         
@@ -944,6 +950,25 @@ class ImageProcessingApp:
         except Exception as e:
             self.handle_error(f"Error equalizing histogram: {str(e)}")
     
+    def apply_color_balance(self, r_factor, g_factor, b_factor, dialog=None):
+        """Apply color balance adjustments to the image"""
+        try:
+            self.update_status(f"Adjusting color balance (R:{r_factor:.2f}, G:{g_factor:.2f}, B:{b_factor:.2f})...")
+            self.processor.adjust_color_balance(
+                r_factor=r_factor,
+                g_factor=g_factor,
+                b_factor=b_factor
+            )
+            self.update_filter_stack_display()
+            self.display_image()
+            self.update_status("Color balance adjusted")
+            
+            if dialog:
+                dialog.destroy()
+                
+        except Exception as e:
+            self.handle_error(f"Error adjusting color balance: {str(e)}")
+
     def apply_edge_detection(self, method, dialog=None):
         """Apply edge detection with the specified method"""
         if not self.image_loaded:
