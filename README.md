@@ -102,7 +102,6 @@ python main.py
 - `ImageProcessor.py`: Core image processing functionality
 - `FilterStack.py`: Filter management system
 - `ImageDialogs.py`: Dialog windows for parameter input
-- `models.py`: Model management for computer vision features
 
 ## Dependencies
 
