@@ -482,6 +482,9 @@ class ImageProcessor:
         
         # Run segmentation
         results = self.yolo_seg_model(image_for_segmentation)
+
+        if results[0] is None or results[0].masks is None:
+            return
         
         # Extract masks and classes
         masks = results[0].masks.data.cpu().numpy()
@@ -543,17 +546,6 @@ class ImageProcessor:
             bg = cv2.bitwise_and(gray, gray, mask=mask_inv)
             self.processed_image = cv2.add(bg, fg)
             
-        elif mask_mode == 'color_overlay':
-            # Apply color overlay to detected objects
-            overlay_color = np.array([0, 255, 0], dtype=np.uint8)  # Green color
-            colored_mask = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
-            colored_mask = colored_mask * overlay_color
-            
-            # Blend with original image
-            alpha = 0.3
-            self.processed_image = cv2.addWeighted(
-                self.processed_image, 1, colored_mask, alpha, 0
-            )
     
     def apply_object_detection(self, conf_threshold=0.25, classes=None, hide_labels=False, hide_conf=False, model_name='yolov8n.pt'):
         """Detect objects in the image using YOLO and add to filter stack"""
@@ -830,8 +822,7 @@ class ImageProcessingApp:
         
         file_menu = tk.Menu(self.menu_bar, tearoff=0)
         file_menu.add_command(label="Open Image", command=self.load_image, accelerator="Ctrl+O")
-        file_menu.add_command(label="Save", command=self.save_image, accelerator="Ctrl+S")
-        file_menu.add_command(label="Save As", command=self.save_image_as, accelerator="Ctrl+Shift+S")
+        file_menu.add_command(label="Save As", command=self.save_image_as, accelerator="Ctrl+S")
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit, accelerator="Alt+F4")
         
@@ -881,8 +872,7 @@ class ImageProcessingApp:
         
         self.root.config(menu=self.menu_bar)
         self.root.bind("<Control-o>", lambda event: self.load_image())
-        self.root.bind("<Control-s>", lambda event: self.save_image())
-        self.root.bind("<Control-Shift-S>", lambda event: self.save_image_as())
+        self.root.bind("<Control-S>", lambda event: self.save_image_as())
     
     def _create_main_layout(self):
         """Create the main application layout"""
@@ -970,7 +960,7 @@ class ImageProcessingApp:
         save_btn = ttk.Button(
             file_frame,
             text="Save Image",
-            command=self.save_image,
+            command=self.save_image_as,
             style="success.TButton"
         )
         save_btn.pack(pady=5, fill=X, padx=5)
@@ -1017,6 +1007,13 @@ class ImageProcessingApp:
             width=12
         )
         flip_v_btn.pack(side=RIGHT, padx=(2, 0), fill=X, expand=YES)
+
+        shear_btn = ttk.Button(
+            transform_frame,
+            text="Shear Transform",
+            command=self.apply_shear_dialog
+        )
+        shear_btn.pack(pady=5, fill=X, padx=5)
         
         rotation_frame = ttk.Frame(transform_frame)
         rotation_frame.pack(fill=X, padx=(0,0))
@@ -1117,14 +1114,7 @@ class ImageProcessingApp:
             width=8
         )
         canny_btn.pack(side=LEFT, padx=(2, 0), fill=X, expand=YES)
-        
-        shear_btn = ttk.Button(
-            advanced_frame,
-            text="Shear Transform",
-            command=self.apply_shear_dialog
-        )
-        shear_btn.pack(pady=5, fill=X, padx=5)
-        
+                
         object_detection_btn = ttk.Button(
             advanced_frame,
             text="Object Detection",
@@ -1398,23 +1388,7 @@ class ImageProcessingApp:
             
         except Exception as e:
             self.handle_error(f"Error loading image: {str(e)}")
-    
-    def save_image(self, event=None):
-        """Save the current image"""
-        if not self.image_loaded:
-            self.handle_error("No image to save")
-            return
         
-        try:
-            if self.current_image_path:
-                self.processor.save_image(self.current_image_path)
-                self.update_status(f"Saved to: {os.path.basename(self.current_image_path)}")
-            else:
-                self.save_image_as()
-                
-        except Exception as e:
-            self.handle_error(f"Error saving image: {str(e)}")
-    
     def save_image_as(self, event=None):
         """Save the current image with a new filename"""
         if not self.image_loaded:
@@ -3086,13 +3060,6 @@ class ImageProcessingApp:
             )
             isolate_radio.pack(anchor=W, padx=5, pady=2)
             
-            color_overlay_radio = ttk.Radiobutton(
-                mode_frame,
-                text="Color Overlay",
-                variable=mode_var,
-                value="color_overlay"
-            )
-            color_overlay_radio.pack(anchor=W, padx=5, pady=2)
             
             # Blur strength (only visible when blur mode is selected)
             strength_frame = ttk.Frame(controls_frame)
@@ -3127,23 +3094,7 @@ class ImageProcessingApp:
             mode_var.trace_add("write", update_strength_visibility)
             update_strength_visibility()  # Initial update
             
-            # Show/hide labels option
-            labels_var = tk.BooleanVar(value=False)
-            labels_check = ttk.Checkbutton(
-                controls_frame,
-                text="Hide Labels",
-                variable=labels_var
-            )
-            labels_check.pack(anchor=W, pady=5)
-            
-            note_label = ttk.Label(
-                controls_frame, 
-                text="Note: Instance segmentation provides pixel-precise masks\nfor detected objects.",
-                font=("Helvetica", 9, "italic"),
-                justify=LEFT
-            )
-            note_label.pack(pady=5, anchor=W)
-            
+
             button_frame = ttk.Frame(controls_frame)
             button_frame.pack(fill=X, pady=10)
             
@@ -3162,7 +3113,6 @@ class ImageProcessingApp:
                     get_selected_class_id(),
                     mode_var.get(),
                     strength_var.get(),
-                    labels_var.get(),
                     dialog
                 )
             )
@@ -3171,7 +3121,7 @@ class ImageProcessingApp:
         except Exception as e:
             self.handle_error(f"Error creating instance segmentation dialog: {str(e)}")
     
-    def apply_instance_segmentation(self, class_id, mask_mode, mask_strength, hide_labels, dialog=None):
+    def apply_instance_segmentation(self, class_id, mask_mode, mask_strength, hide_labels=False, dialog=None):
         """Apply instance segmentation to the image"""
         try:
             mode_str = mask_mode.capitalize().replace('_', ' ')
