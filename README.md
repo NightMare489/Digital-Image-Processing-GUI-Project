@@ -15,6 +15,19 @@ This application is a modern, feature-rich image processing tool built with Pyth
 - **Real-time Preview**: Side-by-side comparison of original and processed images
 - **Histogram Visualization**: RGB and grayscale histogram display
 
+### Example Results
+
+Here are some examples of image processing performed with this application:
+
+![Original Image](img1.png)
+*Original image loaded in the application*
+
+![Image Segmentation](img2.png)
+*Example of image segmentation dialog*
+
+![Multiple Filters](img3.png)
+*Example of multiple filters applied to an image*
+
 ## How to Run the Code
 
 ### Prerequisites
