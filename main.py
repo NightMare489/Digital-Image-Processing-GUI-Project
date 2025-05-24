@@ -14,6 +14,7 @@ from matplotlib.figure import Figure
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Callable
+from ultralytics import YOLO
 
 
 @dataclass
@@ -101,6 +102,10 @@ class ImageProcessor:
         # Filter stack to track applied filters
         self.filter_stack = FilterStack()
         
+        # Initialize YOLO model (will be loaded on first use)
+        self.yolo_model = None
+        self.detection_results = None
+        
         # Map of filter types to processing functions
         self.filter_functions = {
             'grayscale': self._apply_grayscale,
@@ -115,7 +120,9 @@ class ImageProcessor:
             'noise_reduction': self._apply_noise_reduction,
             'histogram_equalization': self._apply_histogram_equalization,
             'edge_detection': self._apply_edge_detection,
-            'shear': self._apply_shear
+            'shear': self._apply_shear,
+            'object_detection': self._apply_object_detection,
+            'instance_segmentation': self._apply_instance_segmentation
         }
     
     def load_image(self, file_path):
@@ -412,6 +419,193 @@ class ImageProcessor:
         
         self.processed_image = cv2.warpAffine(img_x_sheared, M_y, (cols, rows))
     
+    def _load_yolo_model(self, model_name='yolov8n.pt'):
+        """Load YOLO model if not already loaded"""
+        if self.yolo_model is None:
+            try:
+                self.yolo_model = YOLO(model_name)
+                return True
+            except Exception as e:
+                raise ValueError(f"Failed to load YOLO model: {str(e)}")
+        return True
+    
+    def _load_yolo_segmentation_model(self, model_name='yolov8m-seg.pt'):
+        """Load YOLO segmentation model if not already loaded"""
+        if not hasattr(self, 'yolo_seg_model') or self.yolo_seg_model is None:
+            try:
+                self.yolo_seg_model = YOLO(model_name)
+                return True
+            except Exception as e:
+                raise ValueError(f"Failed to load YOLO segmentation model: {str(e)}")
+        return True
+    
+    def _apply_object_detection(self, params: Dict[str, Any]) -> None:
+        """Apply object detection using YOLO"""
+        if self.processed_image is None:
+            return
+        
+        conf_threshold = params.get('conf_threshold', 0.25)
+        classes = params.get('classes', None)  # List of class ids to detect
+        hide_labels = params.get('hide_labels', False)
+        hide_conf = params.get('hide_conf', False)
+        
+        # Load YOLO model if not already loaded
+        self._load_yolo_model(params.get('model_name', 'yolov8n.pt'))
+        
+        # Convert image to format expected by YOLO
+        image_for_detection = self.processed_image.copy()
+        
+        # Run detection
+        self.detection_results = self.yolo_model(image_for_detection, conf=conf_threshold, classes=classes)
+        
+        # Draw detection results on image
+        annotated_image = self.detection_results[0].plot(
+            line_width=1,
+            labels=not hide_labels,
+            conf=not hide_conf
+        )
+        
+        # Update processed image with detections
+        self.processed_image = annotated_image
+    
+    
+    def _apply_instance_segmentation(self, params: Dict[str, Any]) -> None:
+        """Apply instance segmentation using YOLO segmentation model"""
+        if self.processed_image is None:
+            return
+        
+        # Load YOLO segmentation model if not already loaded
+        self._load_yolo_segmentation_model(params.get('model_name', 'yolov8m-seg.pt'))
+        
+        # Convert image to format expected by YOLO
+        image_for_segmentation = self.processed_image.copy()
+        
+        # Run segmentation
+        results = self.yolo_seg_model(image_for_segmentation)
+        
+        # Extract masks and classes
+        masks = results[0].masks.data.cpu().numpy()
+        classes = results[0].boxes.cls.cpu().numpy().astype(int)
+        
+        # Create mask based on selected class
+        class_id = params.get('class_id', None)
+        mask_mode = params.get('mask_mode', 'highlight')
+        mask_strength = params.get('mask_strength', 15)
+        hide_labels = params.get('hide_labels', False)
+        
+        combined_mask = np.zeros(self.processed_image.shape[:2], dtype=np.uint8)
+        original_height, original_width = self.processed_image.shape[:2]
+
+        for i, mask in enumerate(masks):
+            if class_id is None or classes[i] == class_id:
+                # Resize the mask to match the original image size
+                resized_mask = cv2.resize(mask.astype(np.uint8), (original_width, original_height), interpolation=cv2.INTER_NEAREST)
+                combined_mask = np.maximum(combined_mask, resized_mask * 255)
+
+        
+        # Apply mask according to selected mode
+        if mask_mode == 'highlight':
+            # Create a colored highlight effect
+            colored_mask = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
+            colored_mask[:, :, 0] = 0  # Set blue channel to 0
+            colored_mask[:, :, 1] = combined_mask  # Green channel
+            colored_mask[:, :, 2] = 0  # Set red channel to 0
+            
+            # Blend with original image
+            alpha = 0.3
+            self.processed_image = cv2.addWeighted(
+                self.processed_image, 1, colored_mask, alpha, 0
+            )
+            
+        elif mask_mode == 'blur':
+            # Blur only the detected objects
+            blurred = cv2.GaussianBlur(
+                self.processed_image, 
+                (mask_strength, mask_strength), 
+                0
+            )
+            mask_inv = cv2.bitwise_not(combined_mask)
+            
+            # Keep original where mask is 0, use blurred where mask is 255
+            bg = cv2.bitwise_and(self.processed_image, self.processed_image, mask=mask_inv)
+            fg = cv2.bitwise_and(blurred, blurred, mask=combined_mask)
+            self.processed_image = cv2.add(bg, fg)
+            
+        elif mask_mode == 'isolate':
+            # Keep only the detected objects, make the rest gray
+            gray = cv2.cvtColor(self.processed_image, cv2.COLOR_RGB2GRAY)
+            gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+            
+            mask_inv = cv2.bitwise_not(combined_mask)
+            
+            # Use original where mask is 255, use gray where mask is 0
+            fg = cv2.bitwise_and(self.processed_image, self.processed_image, mask=combined_mask)
+            bg = cv2.bitwise_and(gray, gray, mask=mask_inv)
+            self.processed_image = cv2.add(bg, fg)
+            
+        elif mask_mode == 'color_overlay':
+            # Apply color overlay to detected objects
+            overlay_color = np.array([0, 255, 0], dtype=np.uint8)  # Green color
+            colored_mask = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
+            colored_mask = colored_mask * overlay_color
+            
+            # Blend with original image
+            alpha = 0.3
+            self.processed_image = cv2.addWeighted(
+                self.processed_image, 1, colored_mask, alpha, 0
+            )
+    
+    def apply_object_detection(self, conf_threshold=0.25, classes=None, hide_labels=False, hide_conf=False, model_name='yolov8n.pt'):
+        """Detect objects in the image using YOLO and add to filter stack"""
+        if self.processed_image is None:
+            raise ValueError("No image loaded")
+        
+        params = {
+            'conf_threshold': conf_threshold,
+            'classes': classes,
+            'hide_labels': hide_labels,
+            'hide_conf': hide_conf,
+            'model_name': model_name
+        }
+        
+        class_str = ""
+        if classes:
+            class_names = self._get_class_names(classes)
+            class_str = f" ({', '.join(class_names)})"
+        
+        filter_name = f"Object Detection{class_str}"
+        return self.add_filter(filter_name, 'object_detection', params)
+    
+    
+    def apply_instance_segmentation(self, class_id=None, mask_mode='highlight', mask_strength=15, hide_labels=False):
+        """Apply instance segmentation and add to filter stack"""
+        if self.processed_image is None:
+            raise ValueError("No image loaded")
+        
+        params = {
+            'class_id': class_id,
+            'mask_mode': mask_mode,
+            'mask_strength': mask_strength,
+            'hide_labels': hide_labels
+        }
+        
+        class_str = ""
+        if class_id is not None:
+            class_names = self._get_class_names([class_id])
+            class_str = f" ({class_names[0]})"
+        
+        mode_str = mask_mode.capitalize().replace('_', ' ')
+        filter_name = f"Instance Segmentation{class_str} - {mode_str}"
+        return self.add_filter(filter_name, 'instance_segmentation', params)
+    
+    def _get_class_names(self, class_ids):
+        """Get class names from class IDs"""
+        if self.yolo_model is None:
+            self._load_yolo_model()
+        
+        names = self.yolo_model.names
+        return [names.get(cid, f"Class {cid}") for cid in class_ids]
+    
     def apply_edge_detection(self, method='sobel', threshold1=100, threshold2=200, preview=False):
         """Apply edge detection and add to filter stack"""
         params = {
@@ -673,6 +867,8 @@ class ImageProcessingApp:
         advanced_menu.add_cascade(label="Edge Detection", menu=edge_menu)
         
         advanced_menu.add_command(label="Shear", command=self.apply_shear_dialog)
+        advanced_menu.add_command(label="Object Detection", command=self.apply_object_detection_dialog)
+        advanced_menu.add_command(label="Instance Segmentation", command=self.apply_instance_segmentation_dialog)
         edit_menu.add_cascade(label="Advanced Filters", menu=advanced_menu)
         
         self.menu_bar.add_cascade(label="Edit", menu=edit_menu)
@@ -928,6 +1124,20 @@ class ImageProcessingApp:
             command=self.apply_shear_dialog
         )
         shear_btn.pack(pady=5, fill=X, padx=5)
+        
+        object_detection_btn = ttk.Button(
+            advanced_frame,
+            text="Object Detection",
+            command=self.apply_object_detection_dialog
+        )
+        object_detection_btn.pack(pady=5, fill=X, padx=5)
+         
+        instance_segmentation_btn = ttk.Button(
+            advanced_frame,
+            text="Instance Segmentation",
+            command=self.apply_instance_segmentation_dialog
+        )
+        instance_segmentation_btn.pack(pady=5, fill=X, padx=5)
         
         view_frame = ttk.LabelFrame(self.sidebar, text="View Options")
         view_frame.pack(fill=X, padx=(0,15), pady=5)
@@ -2680,6 +2890,309 @@ class ImageProcessingApp:
                 
         except Exception as e:
             self.handle_error(f"Error applying shear: {str(e)}")
+    
+    def apply_object_detection_dialog(self):
+        """Show dialog for object detection parameters"""
+        if not self.image_loaded:
+            self.handle_error("No image loaded")
+            return
+        
+        try:
+            dialog = ttk.Toplevel(self.root)
+            dialog.title("Object Detection")
+            dialog.geometry("350x250")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            
+            controls_frame = ttk.Frame(dialog, padding=10)
+            controls_frame.pack(fill=BOTH, expand=YES)
+            
+            conf_frame = ttk.Frame(controls_frame)
+            conf_frame.pack(fill=X, pady=5)
+            
+            conf_label = ttk.Label(conf_frame, text="Confidence Threshold:")
+            conf_label.pack(side=LEFT)
+            
+            conf_var = tk.DoubleVar(value=0.25)
+            conf_slider = ttk.Scale(
+                conf_frame,
+                from_=0.0,
+                to=1.0,
+                variable=conf_var,
+                orient=HORIZONTAL,
+                command=lambda val: conf_var.set(float(val).__round__(2))
+            )
+            conf_slider.pack(side=LEFT, fill=X, expand=YES, padx=5)
+            
+            formatted_conf = tk.StringVar()
+            
+            def update_conf_text(*args):
+                formatted_conf.set(f"{conf_var.get():.2f}")
+            
+            conf_var.trace_add("write", update_conf_text)
+            update_conf_text()
+            
+            conf_value = ttk.Label(conf_frame, textvariable=formatted_conf)
+            conf_value.pack(side=LEFT, padx=(0, 5))
+            
+            labels_frame = ttk.Frame(controls_frame)
+            labels_frame.pack(fill=X, pady=5)
+            
+            hide_labels_var = tk.BooleanVar(value=False)
+            hide_labels_check = ttk.Checkbutton(
+                labels_frame, 
+                text="Hide Labels",
+                variable=hide_labels_var
+            )
+            hide_labels_check.pack(side=LEFT, padx=5)
+            
+            hide_conf_var = tk.BooleanVar(value=False)
+            hide_conf_check = ttk.Checkbutton(
+                labels_frame, 
+                text="Hide Confidence",
+                variable=hide_conf_var
+            )
+            hide_conf_check.pack(side=LEFT, padx=5)
+            
+            button_frame = ttk.Frame(controls_frame)
+            button_frame.pack(fill=X, pady=10)
+            
+            cancel_btn = ttk.Button(
+                button_frame,
+                text="Cancel",
+                command=dialog.destroy
+            )
+            cancel_btn.pack(side=RIGHT, padx=5)
+            
+            apply_btn = ttk.Button(
+                button_frame,
+                text="Apply",
+                style="primary.TButton",
+                command=lambda: self.apply_object_detection(
+                    conf_var.get(),
+                    None,
+                    hide_labels_var.get(),
+                    hide_conf_var.get(),
+                    dialog
+                )
+            )
+            apply_btn.pack(side=RIGHT, padx=5)
+            
+        except Exception as e:
+            self.handle_error(f"Error creating object detection dialog: {str(e)}")
+    
+    def apply_object_detection(self, conf_threshold, classes, hide_labels, hide_conf, dialog=None):
+        """Apply object detection to the image"""
+        try:
+            self.update_status(f"Applying object detection (conf: {conf_threshold:.2f})...")
+            self.processor.apply_object_detection(
+                conf_threshold=conf_threshold,
+                classes=classes,
+                hide_labels=hide_labels,
+                hide_conf=hide_conf
+            )
+            self.update_filter_stack_display()
+            self.display_image()
+            self.update_status("Object detection applied")
+            
+            if dialog:
+                dialog.destroy()
+                
+        except Exception as e:
+            self.handle_error(f"Error applying object detection: {str(e)}")
+    
+
+    def apply_instance_segmentation_dialog(self):
+        """Show dialog for instance segmentation parameters"""
+        if not self.image_loaded:
+            self.handle_error("No image loaded")
+            return
+        
+        try:
+            dialog = ttk.Toplevel(self.root)
+            dialog.title("Instance Segmentation")
+            dialog.geometry("400x350")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            
+            controls_frame = ttk.Frame(dialog, padding=10)
+            controls_frame.pack(fill=BOTH, expand=YES)
+            
+            # Class selection
+            class_frame = ttk.Frame(controls_frame)
+            class_frame.pack(fill=X, pady=5)
+            
+            class_label = ttk.Label(class_frame, text="Class:")
+            class_label.pack(side=LEFT)
+            
+            # Load YOLO model to get class names
+            self.processor._load_yolo_model()
+            class_names = {idx: name for idx, name in self.processor.yolo_model.names.items()}
+            
+            # Add "All Classes" option
+            classes_with_all = {-1: "All Classes"}
+            classes_with_all.update(class_names)
+            
+            class_var = tk.IntVar(value=-1)  # Default to All Classes
+            class_dropdown = ttk.Combobox(
+                class_frame,
+                textvariable=class_var,
+                state="readonly"
+            )
+            
+            # Format class options as "ID: Name"
+            class_options = [f"{idx}: {name}" for idx, name in classes_with_all.items()]
+            class_dropdown['values'] = class_options
+            class_dropdown.current(0)  # Set to "All Classes"
+            class_dropdown.pack(side=LEFT, fill=X, expand=YES, padx=5)
+            
+            # Extract class ID from selection
+            def get_selected_class_id():
+                selection = class_dropdown.get()
+                if selection.startswith("-1:"):
+                    return None
+                return int(selection.split(":")[0])
+            
+            # Visualization mode selection
+            mode_frame = ttk.Frame(controls_frame)
+            mode_frame.pack(fill=X, pady=5)
+            
+            mode_label = ttk.Label(mode_frame, text="Visualization Mode:")
+            mode_label.pack(side=LEFT)
+            
+            mode_var = tk.StringVar(value="highlight")
+            
+            highlight_radio = ttk.Radiobutton(
+                mode_frame,
+                text="Highlight",
+                variable=mode_var,
+                value="highlight"
+            )
+            highlight_radio.pack(anchor=W, padx=5, pady=2)
+            
+            blur_radio = ttk.Radiobutton(
+                mode_frame,
+                text="Blur",
+                variable=mode_var,
+                value="blur"
+            )
+            blur_radio.pack(anchor=W, padx=5, pady=2)
+            
+            isolate_radio = ttk.Radiobutton(
+                mode_frame,
+                text="Isolate",
+                variable=mode_var,
+                value="isolate"
+            )
+            isolate_radio.pack(anchor=W, padx=5, pady=2)
+            
+            color_overlay_radio = ttk.Radiobutton(
+                mode_frame,
+                text="Color Overlay",
+                variable=mode_var,
+                value="color_overlay"
+            )
+            color_overlay_radio.pack(anchor=W, padx=5, pady=2)
+            
+            # Blur strength (only visible when blur mode is selected)
+            strength_frame = ttk.Frame(controls_frame)
+            strength_frame.pack(fill=X, pady=5)
+            
+            strength_label = ttk.Label(strength_frame, text="Blur Strength:")
+            strength_label.pack(side=LEFT)
+            
+            strength_var = tk.IntVar(value=15)
+            strength_slider = ttk.Scale(
+                strength_frame,
+                from_=3,
+                to=51,
+                variable=strength_var,
+                command=lambda val: strength_var.set(
+                    int(float(val)) if int(float(val)) % 2 == 1 else int(float(val)) + 1
+                ),
+                orient=HORIZONTAL
+            )
+            strength_slider.pack(side=LEFT, fill=X, expand=YES, padx=5)
+            
+            strength_value = ttk.Label(strength_frame, textvariable=strength_var)
+            strength_value.pack(side=LEFT, padx=(0, 5))
+            
+            # Show/hide strength based on mode
+            def update_strength_visibility(*args):
+                if mode_var.get() == "blur":
+                    strength_frame.pack(fill=X, pady=5)
+                else:
+                    strength_frame.pack_forget()
+            
+            mode_var.trace_add("write", update_strength_visibility)
+            update_strength_visibility()  # Initial update
+            
+            # Show/hide labels option
+            labels_var = tk.BooleanVar(value=False)
+            labels_check = ttk.Checkbutton(
+                controls_frame,
+                text="Hide Labels",
+                variable=labels_var
+            )
+            labels_check.pack(anchor=W, pady=5)
+            
+            note_label = ttk.Label(
+                controls_frame, 
+                text="Note: Instance segmentation provides pixel-precise masks\nfor detected objects.",
+                font=("Helvetica", 9, "italic"),
+                justify=LEFT
+            )
+            note_label.pack(pady=5, anchor=W)
+            
+            button_frame = ttk.Frame(controls_frame)
+            button_frame.pack(fill=X, pady=10)
+            
+            cancel_btn = ttk.Button(
+                button_frame,
+                text="Cancel",
+                command=dialog.destroy
+            )
+            cancel_btn.pack(side=RIGHT, padx=5)
+            
+            apply_btn = ttk.Button(
+                button_frame,
+                text="Apply",
+                style="primary.TButton",
+                command=lambda: self.apply_instance_segmentation(
+                    get_selected_class_id(),
+                    mode_var.get(),
+                    strength_var.get(),
+                    labels_var.get(),
+                    dialog
+                )
+            )
+            apply_btn.pack(side=RIGHT, padx=5)
+            
+        except Exception as e:
+            self.handle_error(f"Error creating instance segmentation dialog: {str(e)}")
+    
+    def apply_instance_segmentation(self, class_id, mask_mode, mask_strength, hide_labels, dialog=None):
+        """Apply instance segmentation to the image"""
+        try:
+            mode_str = mask_mode.capitalize().replace('_', ' ')
+            self.update_status(f"Applying instance segmentation ({mode_str})...")
+            
+            self.processor.apply_instance_segmentation(
+                class_id=class_id,
+                mask_mode=mask_mode,
+                mask_strength=mask_strength,
+                hide_labels=hide_labels
+            )
+            
+            self.update_filter_stack_display()
+            self.display_image()
+            self.update_status("Instance segmentation applied")
+            
+            if dialog:
+                dialog.destroy()
+                
+        except Exception as e:
+            self.handle_error(f"Error applying instance segmentation: {str(e)}")
 
 
 def main():
